@@ -1,0 +1,606 @@
+#include <bits/stdc++.h>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
+
+using namespace std;
+using namespace cv;
+
+//SIFT implementation
+////////////////////////////////////////////
+const float sigma = 0.5;
+const float k = sqrt(2.0);
+const float contrast_threshold = 0.03;
+const float magnitude_threshold = 0.2;
+const float r = 10.0;
+const float PI = acos(-1.0);
+
+//Gives the type used for pixels
+string type2str(int type) {
+  string r;
+
+  uchar depth = type & CV_MAT_DEPTH_MASK;
+  uchar chans = 1 + (type >> CV_CN_SHIFT);
+
+  switch ( depth ) {
+    case CV_8U:  r = "8U"; break;
+    case CV_8S:  r = "8S"; break;
+    case CV_16U: r = "16U"; break;
+    case CV_16S: r = "16S"; break;
+    case CV_32S: r = "32S"; break;
+    case CV_32F: r = "32F"; break;
+    case CV_64F: r = "64F"; break;
+    default:     r = "User"; break;
+  }
+
+  r += "C";
+  r += (chans+'0');
+
+  return r;
+}
+
+//Convert pixel representation from char to float
+Mat char_to_float(Mat &I){
+	Mat I_transf = Mat::zeros(I.rows, I.cols, CV_32FC1);
+
+	for(int i=0;i<I.rows;i++){
+		for(int j=0;j<I.cols;j++){
+			I_transf.at<float>(i,j) = I.at<uchar>(i,j)/255.0;
+		}
+	}
+
+	return I_transf;
+}
+
+//Subsample an image by a given factor
+Mat subsample(Mat &I, float factor){
+	Mat tmp = I, dst = I;
+
+	pyrDown( tmp, dst, Size( tmp.cols/factor, tmp.rows/factor ));
+
+	return dst;
+}
+
+//Get a gaussian pyramid from an image
+vector<Mat> get_pyramid(Mat &I, int levels){
+	Mat tmp = I, dst = I;
+	vector<Mat> pyramid;
+
+	int level = 0;
+	pyramid.push_back(dst);
+
+	level++;
+
+	while(level < levels){
+		dst = subsample(tmp, 2);
+		pyramid.push_back(dst);
+		level++;
+		tmp = dst;
+	}
+
+	return pyramid;
+}
+
+//Get the scale space
+vector<vector<Mat>> get_scale_space(Mat &I){
+	vector<Mat> pyramid = get_pyramid(I, 4);
+	vector<vector<Mat>> scale_space(4, vector<Mat>(5));
+
+	for(int i=0;i<4;i++){	
+		GaussianBlur(pyramid[i], pyramid[i], Size(0,0), sigma);
+		scale_space[i][0] = pyramid[i];
+
+		for(int j=1;j<5;j++){
+			Mat aux;
+			GaussianBlur(pyramid[i], aux, Size(0,0), pow(k,j)*sigma);
+			scale_space[i][j] = aux;
+		}
+	}
+
+	return scale_space;
+}
+
+//Get the difference of gaussians
+vector<vector<Mat>> get_dog(vector<vector<Mat>> &scale_space){
+	vector<vector<Mat>> dog(4, vector<Mat>(4));
+
+	for(int i=0;i<4;i++){
+		for(int j=0;j<4;j++){
+			dog[i][j] = abs(scale_space[i][j+1] - scale_space[i][j]);
+		}
+	}
+
+	return dog;
+}
+
+//Auxiliar function to get the keypoints
+bool is_max(Mat &I1, Mat &I2, Mat &I3, int row, int col){
+	for(int i=-1;i<=1;i++){
+		for(int j=-1;j<=1;j++){
+			if(i == 0 && j == 0) continue;
+
+			if(I2.at<float>(row,col) < I2.at<float>(row+i,col+j)) return false; 
+		}
+	}
+
+	for(int i=-1;i<=1;i++){
+		for(int j=-1;j<=1;j++){
+			if(I2.at<float>(row,col) < I1.at<float>(row+i,col+j) ||
+				I2.at<float>(row,col) < I3.at<float>(row+i,col+j)) return false;
+		}
+	}
+
+	return true;
+}
+
+//Auxiliar function to get the keypoints
+bool is_min(Mat &I1, Mat &I2, Mat &I3, int row, int col){
+	for(int i=-1;i<=1;i++){
+		for(int j=-1;j<=1;j++){
+			if(i == 0 && j == 0) continue;
+
+			if(I2.at<float>(row,col) > I2.at<float>(row+i,col+j)) return false; 
+		}
+	}
+
+	for(int i=-1;i<=1;i++){
+		for(int j=-1;j<=1;j++){
+			if(I2.at<float>(row,col) > I1.at<float>(row+i,col+j) ||
+				I2.at<float>(row,col) > I3.at<float>(row+i,col+j)) return false;
+		}
+	}
+
+	return true;
+}
+
+//Get the keypoints
+vector<vector<Mat>> get_keypoints(vector<vector<Mat>> &dog){
+	vector<vector<Mat>> keypoints(4, vector<Mat>(2));
+
+	for(int i=0;i<4;i++){
+		Mat first = dog[i][0];
+		Mat second = dog[i][1];
+		Mat third = dog[i][2];
+		Mat fourth = dog[i][3];
+		Mat keypoints1 = Mat::zeros(first.rows, first.cols, CV_32FC1);
+		Mat keypoints2 = Mat::zeros(first.rows, first.cols, CV_32FC1);
+
+		for(int row = 1; row < second.rows - 1; row++){
+			for(int col = 1; col < second.cols - 1; col++){
+				if(is_max(first, second, third, row, col) || is_min(first, second, third, row, col))
+					keypoints1.at<float>(row,col) = 1;
+
+				if(is_max(second, third, fourth, row, col) || is_min(second, third, fourth, row, col))
+					keypoints2.at<float>(row,col) = 1;
+			}
+		}
+
+		keypoints[i][0] = keypoints1;
+		keypoints[i][1] = keypoints2;
+	}
+
+	return keypoints;
+}
+
+//Remove low contrast keypoints
+void remove_low_contrast(vector<vector<Mat>> &keypoints, vector<vector<Mat>> &dog){
+	for(int i=0;i<4;i++){
+		Mat second = dog[i][1];
+		Mat third = dog[i][2];
+
+		for(int row = 0; row < second.rows; row++){
+			for(int col = 0; col < second.cols; col++){
+				if(keypoints[i][0].at<float>(row,col) == 1 && second.at<float>(row,col) < contrast_threshold)
+					keypoints[i][0].at<float>(row,col) = 0;
+
+				if(keypoints[i][1].at<float>(row,col) == 1 && third.at<float>(row,col) < contrast_threshold)
+					keypoints[i][1].at<float>(row,col) = 0;
+			}
+		}
+	}
+}
+
+//Remove edges from the keypoints
+void remove_edges(vector<vector<Mat>> &keypoints, vector<vector<Mat>> &dog){
+	for(int i=0;i<4;i++){
+		Mat second = dog[i][1];
+		Mat third = dog[i][2];
+
+		for(int row=1;row < second.rows - 1; row++){
+			for(int col = 1; col < second.cols - 1; col++){
+				float dxx = second.at<float>(row,col+1) + second.at<float>(row,col-1) - 2*second.at<float>(row,col);
+				float dyy = second.at<float>(row+1,col) + second.at<float>(row-1,col) - 2*second.at<float>(row,col);
+				float dxy = (second.at<float>(row+1,col+1) + second.at<float>(row-1,col-1) - second.at<float>(row-1,col+1) - second.at<float>(row+1,col-1))/4;
+				float trH = dxx + dyy;
+				float detH = dxx*dyy - dxy*dxy;
+
+				if(detH < 0 || ((trH*trH)/detH) > (((r+1)*(r+1))/r)) keypoints[i][0].at<float>(row,col) = 0;
+
+				dxx = third.at<float>(row,col+1) + third.at<float>(row,col-1) - 2*third.at<float>(row,col);
+				dyy = third.at<float>(row+1,col) + third.at<float>(row-1,col) - 2*third.at<float>(row,col);
+				dxy = (third.at<float>(row+1,col+1) + third.at<float>(row-1,col-1) - third.at<float>(row-1,col+1) - third.at<float>(row+1,col-1))/4;
+				trH = dxx + dyy;
+				detH = dxx*dyy - dxy*dxy;
+
+				if(detH < 0 || ((trH*trH)/detH) > (((r+1)*(r+1))/r)) keypoints[i][1].at<float>(row,col) = 0;
+			}
+		}
+	}
+}
+
+//Get angle between two vectors in a plane (from the origin)
+float get_angle(float x, float y){
+	float ang = atan2(y,x);
+
+	if(ang < 0) ang += 2*PI;
+
+	return (ang*180.0)/PI;
+}
+
+//Get magnitudes of gradients in the scale space
+vector<vector<Mat>> get_magnitudes(vector<vector<Mat>> &scale_space){
+	vector<vector<Mat>> magnitudes(4, vector<Mat>(5));
+
+	for(int i=0;i<4;i++){
+		for(int j=0;j<5;j++){
+			Mat L = scale_space[i][j];
+			Mat mag = Mat::zeros(L.rows, L.cols, CV_32FC1);
+
+			for(int row=1;row < L.rows - 1;row++){
+				for(int col=1;col < L.cols - 1;col++){
+					float dx = L.at<float>(row,col+1) - L.at<float>(row,col-1);
+					float dy = L.at<float>(row+1,col) - L.at<float>(row-1,col);
+
+					mag.at<float>(row,col) = sqrt(dx*dx + dy*dy);
+				}
+			}
+
+			GaussianBlur(mag, mag, Size(0,0), 1.5*sigma*pow(k,j));
+			magnitudes[i][j] = mag;
+		}
+	}
+
+	return magnitudes;
+}
+
+//Get orientations of gradients in the scale space
+vector<vector<Mat>> get_orientations(vector<vector<Mat>> &scale_space){
+	vector<vector<Mat>> orientations(4, vector<Mat>(5));
+
+	for(int i=0;i<4;i++){
+		for(int j=0;j<5;j++){
+			Mat L = scale_space[i][j];
+			Mat orient = Mat::zeros(L.rows, L.cols, CV_32FC1);
+
+			for(int row=1;row < L.rows - 1;row++){
+				for(int col=1;col < L.cols - 1;col++){
+					float dx = L.at<float>(row,col+1) - L.at<float>(row,col-1);
+					float dy = L.at<float>(row+1,col) - L.at<float>(row-1,col);
+
+					orient.at<float>(row,col) = get_angle(dx, dy);
+				}
+			}
+
+			orientations[i][j] = orient;
+		}
+	}
+
+	return orientations;
+}
+
+//Get kernel size for the keypoints orientations
+int get_kernel_size(float var){
+	int size = 39;
+
+	for(int i=1;i<20;i++){
+		if(exp(-((float)(i*i))/(2.0*var*var)) < 0.001){
+			size = 2*i - 1;
+			break;
+		} 
+	}
+
+	return size;
+}
+
+//Get the bin in the histogram
+int get_pos_histogram1(float ang){
+	for(int i=0;i<36;i++){
+		if(ang >= 10.0*i && ang < 10.0*(i+1)) return i;
+	}
+}
+
+//Get keypoints orientations
+vector<vector<vector<vector<vector<float>>>>> get_keypoints_orientations(vector<vector<Mat>> &magnitudes, vector<vector<Mat>> &orientations, vector<vector<Mat>> &keypoints){
+	vector<vector<vector<vector<vector<float>>>>> final_keypoints(4, vector<vector<vector<vector<float>>>>(5));
+
+	for(int i=0;i<4;i++){
+		Mat keypoints1 = keypoints[i][0];
+		Mat keypoints2 = keypoints[i][1];
+
+		for(int j=0;j<5;j++){
+			int kernel_size = get_kernel_size(sigma*pow(k,j));
+			Mat mag = magnitudes[i][j];
+			Mat orient = orientations[i][j];
+			vector<vector<vector<float>>> keys_mat(mag.rows, vector<vector<float>>(mag.cols));
+
+			for(int row=0;row < mag.rows - kernel_size;row++){
+				for(int col=0;col < mag.cols - kernel_size;col++){
+					if(keypoints1.at<float>(row + (kernel_size/2), col + (kernel_size/2)) == 1 || keypoints2.at<float>(row + (kernel_size/2), col + (kernel_size/2)) == 1){
+						vector<float> keys;
+						Mat window_image_mag(mag, Rect(col, row, kernel_size, kernel_size));
+						Mat window_image_orient(orient, Rect(col, row, kernel_size, kernel_size));
+						vector<float> histogram(36);
+
+						for(int k=0;k<window_image_mag.rows;k++){
+							for(int m=0;m<window_image_mag.cols;m++){
+								int pos_hist = get_pos_histogram1(window_image_orient.at<float>(k,m));
+								histogram[pos_hist] += window_image_mag.at<float>(k,m);
+							}
+						}
+
+						float peak = -1.0;
+
+						for(int k=0;k<36;k++){
+							if(histogram[k] > peak) peak = histogram[k];
+						}
+
+						for(int k=0;k<36;k++){
+							if(histogram[k] > 0.8*peak){
+								keys_mat[row][col].push_back(10.0*k + 5.0);
+							}
+						}
+					}
+				}
+			}
+
+			final_keypoints[i][j] = keys_mat;
+		}
+	}
+
+	return final_keypoints;
+}
+
+//Get gaussian weights from a gaussian distribution
+float get_gaussian_weight(int row, int col, int row_begin, int row_end, int col_begin, int col_end, float var){
+	float row_med = (1.0*(row_begin + row_end))/2;
+	float col_med = (1.0*(col_begin + col_end))/2;
+	float row_trans = 1.0*row - row_med;
+	float col_trans = 1.0*col - col_med;
+
+	return (exp(-(row_trans*row_trans + col_trans*col_trans)/(2.0*var*var)))/(2.0*PI*var*var);
+}
+
+//Pass a circular gaussian filter through an image
+Mat get_gaussian_circle(Mat &I, int row_begin, int row_end, int col_begin, int col_end, float var){
+	Mat gaussian_circle = Mat::zeros(row_end - row_begin + 1, col_end - col_begin + 1, CV_32FC1);
+
+	for(int i=0;i<gaussian_circle.rows;i++){
+		for(int j=0;j<gaussian_circle.cols;j++){
+			float weight = get_gaussian_weight(row_begin+i, col_begin+j, row_begin, row_end, col_begin, col_end, var);
+			gaussian_circle.at<float>(i,j) = weight*I.at<float>(row_begin+i, col_begin+j);
+		}
+	}
+
+	return gaussian_circle;
+}
+
+//Get the orientations of all the neighborhood with respect to the keypoint orientation
+Mat renew_orientations(Mat &I, int row_begin, int row_end, int col_begin, int col_end, float keypoint_orientation){
+	Mat orientations = Mat::zeros(row_end - row_begin + 1, col_end - col_begin + 1, CV_32FC1);
+
+	for(int i=0;i<orientations.rows;i++){
+		for(int j=0;j<orientations.cols;j++){
+			orientations.at<float>(i,j) = I.at<float>(row_begin+i, col_begin+j) - keypoint_orientation;
+			if(orientations.at<float>(i,j) < 0) orientations.at<float>(i,j) += 360.0;
+		}
+	}
+
+	return orientations;
+}
+
+//Auxiliar function to run through the neighborhood of a keypoint
+pair<int,int> get_initial_pos(int i, int j){
+	int row, col;
+
+	if(i == 0 || i == 1) row = 4*i;
+	else row = 4*i+1;
+
+	if(j == 0 || j == 1) col = 4*j;
+	else col = 4*j+1;
+
+	return {row, col};
+}
+
+//Get bin in the last histogram 
+int get_pos_histogram2(float ang){
+	for(int i=0;i<8;i++){
+		if(ang >= 45*i && ang < 45*(i+1)) return i;
+	}
+}
+
+//Get descriptors
+vector<vector<float>> get_descriptors(vector<vector<Mat>> &orientations, vector<vector<Mat>> &magnitudes, vector<vector<vector<vector<vector<float>>>>> &keypoints_orientations){
+	vector<vector<float>> descriptors;
+
+	for(int i=0;i<4;i++){
+		for(int j=0;j<5;j++){
+			for(int row=0;row < magnitudes[i][j].rows - 17;row++){
+				for(int col=0;col < magnitudes[i][j].cols - 17;col++){
+					if(keypoints_orientations[i][j][row+8][col+8].size() > 0){
+						for(int k=0;k<(int)keypoints_orientations[i][j][row+8][col+8].size();k++){
+							vector<vector<float>> histograms;
+							Mat gaussian_circle = get_gaussian_circle(magnitudes[i][j], row, row+16, col, col+16, 8.5);
+							Mat orient = renew_orientations(orientations[i][j], row, row+16, col, col+16, keypoints_orientations[i][j][row+8][col+8][k]);
+
+							for(int k=0;k<4;k++){
+								for(int m=0;m<4;m++){
+									vector<float> histogram(8);
+									pair<int,int> initial_pos = get_initial_pos(k, m);
+									int row_begin = initial_pos.first;
+									int col_begin = initial_pos.second;
+
+									for(int row_inside = row_begin; row_inside < row_begin+4; row_inside++){
+										for(int col_inside = col_begin; col_inside < col_begin+4; col_inside++){
+											int pos_hist = get_pos_histogram2(orient.at<float>(row_inside, col_inside));
+											histogram[pos_hist] += gaussian_circle.at<float>(row_inside, col_inside);
+										}
+									}
+
+									histograms.push_back(histogram);
+								}
+							}
+
+							vector<float> descriptor;
+
+							for(int k=0;k<(int)histograms.size();k++){
+								for(int m=0;m<(int)histograms[k].size();m++){
+									descriptor.push_back(histograms[k][m]);
+								}
+							}
+
+							descriptors.push_back(descriptor);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return descriptors;
+}
+
+//Normalize descriptors
+void normalize_vector(vector<float> &descriptor){
+	float norm = 0.0;
+
+	for(int i=0;i<(int)descriptor.size();i++) norm += descriptor[i]*descriptor[i];
+
+	norm = sqrt(norm);
+
+	for(int i=0;i<(int)descriptor.size();i++) descriptor[i] /= norm;
+}
+
+//Filter large magnitudes in the descriptor
+void reduce_large_magnitudes(vector<float> &descriptor){
+	for(int i=0;i<(int)descriptor.size();i++) descriptor[i] = min(descriptor[i], magnitude_threshold);
+}
+
+//Get luminosity invariance in the descriptor
+void get_luminosity_invariance(vector<vector<float>> &descriptors){
+	for(int i=0;i<(int)descriptors.size();i++){
+		normalize_vector(descriptors[i]);
+		reduce_large_magnitudes(descriptors[i]);
+		normalize_vector(descriptors[i]);
+	}
+}
+
+//Wrapper for all the functions previous implemented
+vector<vector<float>> get_SIFT_descriptors(Mat &I){
+	Mat I_gray;
+	cvtColor(I, I_gray, COLOR_BGR2GRAY);
+	Mat I_float = char_to_float(I_gray);
+	vector<vector<Mat>> scale_space = get_scale_space(I_float);
+	vector<vector<Mat>> dog = get_dog(scale_space);
+	vector<vector<Mat>> keypoints = get_keypoints(dog);
+	remove_low_contrast(keypoints, dog);
+	remove_edges(keypoints, dog);
+	vector<vector<Mat>> magnitudes = get_magnitudes(scale_space);
+	vector<vector<Mat>> orientations = get_orientations(scale_space);
+	vector<vector<vector<vector<vector<float>>>>> keypoints_orientations = get_keypoints_orientations(magnitudes, orientations, keypoints);
+	vector<vector<float>> descriptors = get_descriptors(orientations, magnitudes, keypoints_orientations);
+	get_luminosity_invariance(descriptors);
+	return descriptors;
+}
+
+//Get .csv files for the descriptors
+void descriptors_to_csv(vector<vector<float>> &descriptors, int number){
+	ofstream out;
+	string name = "../Descriptors/descriptors" + to_string(number);
+	name = name + ".csv";
+	out.open(name);
+
+	for(int i=0;i<(int)descriptors.size();i++){
+		for(int j=0;j<(int)descriptors[i].size();j++){
+			if(j == 0) out << descriptors[i][j];
+			else out << "," << descriptors[i][j];
+		}
+		out << '\n';
+	}
+
+	out.close();
+}
+
+//Auxiliar function to store the descriptors
+vector<string> get_file_name(){
+	ifstream file("../data/filelist.txt");
+	vector<string> file_name;
+
+	if(file.is_open()){
+		string name;
+
+		while(getline(file, name)) file_name.push_back(name); 
+
+		file.close();
+	}
+
+	return file_name;
+}
+
+//Store the descriptors in the project folder
+void print_descriptors_aux(int classe, int number_begin, int number_end){
+	vector<string> file_name = get_file_name();
+
+	for(int i=number_begin;i<number_end;i++){
+		string file_place = "../data/" + file_name[80*classe + i];
+		Mat aux = imread(file_place);
+		vector<vector<float>> descriptors = get_SIFT_descriptors(aux);
+		descriptors_to_csv(descriptors, 80*classe + i);
+	}
+}
+
+//Draw keypoints
+void draw_keypoints(Mat &I, vector<vector<Mat>> &keypoints){
+	for(int k=0;k<4;k++){
+		for(int i=0;i<keypoints[k][0].rows;i++){
+			for(int j=0;j<keypoints[k][0].cols;j++){
+				if(keypoints[k][0].at<float>(i,j) == 1.0 || keypoints[k][1].at<float>(i,j) == 1.0){
+					if(k == 0) circle(I,Point(((int)pow(2,k))*j,((int)pow(2,k))*i),8,Scalar(255,0,0));
+					else if(k == 1) circle(I,Point(((int)pow(2,k))*j,((int)pow(2,k))*i),7,Scalar(0,255,0));
+					else if(k == 1) circle(I,Point(((int)pow(2,k))*j,((int)pow(2,k))*i),6,Scalar(0,0,255));
+					else if(k == 2) circle(I,Point(((int)pow(2,k))*j,((int)pow(2,k))*i),5,Scalar(255,255,0));
+					else circle(I,Point(((int)pow(2,k))*j,((int)pow(2,k))*i),4,Scalar(0,255,255));
+				} 
+			}
+		}
+	}
+}
+
+int main(int argc, char** argv){
+	//Generate the keypoints for the cat image
+	
+	Mat I = imread("../cat.jpg");
+	Mat I_gray;
+	cvtColor(I, I_gray, COLOR_BGR2GRAY);
+	Mat I_float = char_to_float(I_gray);
+	vector<vector<Mat>> scale_space = get_scale_space(I_float);
+	vector<vector<Mat>> dog = get_dog(scale_space);
+	vector<vector<Mat>> keypoints = get_keypoints(dog);
+	remove_low_contrast(keypoints, dog);
+	remove_edges(keypoints, dog);
+	draw_keypoints(I, keypoints);
+	imshow("Keypoints", I);
+	waitKey(0);
+	
+
+	//Uncomment to generate descriptors files
+	//If memory explode execute it by parts
+	/*
+	print_descriptors_aux(8, 0, 10);
+	print_descriptors_aux(8, 15, 20);
+	print_descriptors_aux(8, 20, 30);
+	print_descriptors_aux(8, 30, 40);
+	print_descriptors_aux(8, 40, 50);
+	print_descriptors_aux(8, 50, 60);
+	print_descriptors_aux(8, 68, 70);
+	print_descriptors_aux(8, 70, 80); */
+	return 0;
+}
